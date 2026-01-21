@@ -3,11 +3,9 @@
 ## What runs
 
 - **SMTP inbound**: `maddy` listens on `:25` and accepts any `*@ragoona.com`.
-- **Parser**: mail is forwarded to a local SMTP sink which feeds raw messages into `/opt/farm/parse_email.py`.
+- **Parser**: mail is processed and extracted into the database (no mailbox/IMAP).
 - **DB**: SQLite at `/opt/farm/worker_farm.db` (table `verification_links`).
-- **API (localhost-only)**: `farm-mail-api` listens on `127.0.0.1:8091`.
-  - `GET /unread` → returns JSON array of all pending rows (`[]` if none).
-  - `POST /read` with JSON `{"id": <int>}` → deletes that row (only if `status='pending'`).
+- **API**: available at `https://mailapi.ragoona.com`.
 
 ## Consumer overview (mail + api)
 
@@ -35,7 +33,7 @@
 
 ## Install / reproduce on a new machine
 
-### 1) Mail server + parser + local API
+### 1) Mail server + parser + API
 
 ```bash
 sudo /root/mail/setup_inbound_mail.sh --test
