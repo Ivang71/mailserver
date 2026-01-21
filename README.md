@@ -5,7 +5,7 @@
 - **SMTP inbound**: `maddy` listens on `:25` and accepts any `*@ragoona.com`.
 - **Parser**: mail is processed and extracted into the database (no mailbox/IMAP).
 - **DB**: SQLite at `/opt/farm/worker_farm.db` (table `verification_links`).
-- **API**: available at `https://mailapi.ragoona.com`.
+- **API**: available at `https://api.ragoona.com`.
 
 ## Consumer overview (mail + api)
 
@@ -15,7 +15,7 @@
 3. Pick the item you want, use its `link`, then delete it via `/read`.
 
 ### API base
-- Public: `https://mailapi.ragoona.com`
+- Public: `https://api.ragoona.com`
 
 ### Endpoints
 - `GET /unread`
@@ -43,14 +43,14 @@ sudo /root/mail/setup_inbound_mail.sh --test
 
 This creates:
 - a tunnel
-- a DNS CNAME for `mailapi.ragoona.com`
-- a `cloudflared-mailapi.service` systemd unit
+- a DNS CNAME for `api.ragoona.com`
+- a `cloudflared-api.service` systemd unit
 
 ```bash
 export CF_API_TOKEN="(your token)"
 sudo /root/mail/setup_cloudflare_tunnel_mail_api.sh
 ```
 
-The tunnel runs using a tunnel **run token** stored in `/etc/cloudflared/mailapi.token` (not your API token).
+The tunnel runs using a tunnel **run token** stored in `/etc/cloudflared/api.token` (not your API token).
 If your network blocks QUIC/UDP, the systemd unit forces HTTP/2 over TCP.
 

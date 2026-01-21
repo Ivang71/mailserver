@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DOMAIN="${DOMAIN:-ragoona.com}"
-MAIL_API_HOSTNAME="${MAIL_API_HOSTNAME:-mailapi.ragoona.com}"
+MAIL_API_HOSTNAME="${MAIL_API_HOSTNAME:-api.ragoona.com}"
 TUNNEL_NAME="${TUNNEL_NAME:-ragoona-mail-api}"
 LOCAL_API_URL="${LOCAL_API_URL:-http://127.0.0.1:8091}"
 
@@ -132,13 +132,13 @@ write_cloudflared_files() {
 
   install -d -m 0755 /etc/cloudflared
 
-  local token_file="/etc/cloudflared/mailapi.token"
+  local token_file="/etc/cloudflared/api.token"
   local token
   token="$(get_tunnel_token "$account_id" "$tunnel_id")"
   printf '%s\n' "$token" >"$token_file"
   chmod 0600 "$token_file"
 
-  local cfg="/etc/cloudflared/mailapi.yml"
+  local cfg="/etc/cloudflared/api.yml"
   cat >"$cfg" <<EOF
 ingress:
   - hostname: ${MAIL_API_HOSTNAME}
@@ -147,7 +147,7 @@ ingress:
 EOF
   chmod 0644 "$cfg"
 
-  local unit="/etc/systemd/system/cloudflared-mailapi.service"
+  local unit="/etc/systemd/system/cloudflared-api.service"
   cat >"$unit" <<EOF
 [Unit]
 Description=Cloudflare Tunnel for ${MAIL_API_HOSTNAME}
@@ -169,7 +169,7 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now cloudflared-mailapi.service
+  systemctl enable --now cloudflared-api.service
 }
 
 create_dns_record() {
