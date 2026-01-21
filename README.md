@@ -18,7 +18,6 @@
 
 ### API base
 - Public: `https://mailapi.ragoona.com`
-- Local (on the server): `http://127.0.0.1:8091`
 
 ### Endpoints
 - `GET /unread`
