@@ -12,12 +12,15 @@ MADDY_CONF="${MADDY_CONF_DIR}/maddy.conf"
 FARM_DIR="/opt/farm"
 PARSER="${FARM_DIR}/parse_email.py"
 SINK="${FARM_DIR}/smtp_sink.py"
+API="${FARM_DIR}/mail_api.py"
 DB="${FARM_DIR}/worker_farm.db"
+API_PORT="${API_PORT:-8091}"
 
 FW_HELPER="/usr/local/sbin/mail-allow-smtp25"
 FW_UNIT="/etc/systemd/system/mail-allow-smtp25.service"
 MADDY_UNIT="/etc/systemd/system/maddy.service"
 SINK_UNIT="/etc/systemd/system/farm-smtp-sink.service"
+API_UNIT="/etc/systemd/system/farm-mail-api.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -72,6 +75,13 @@ ensure_user() {
     return 0
   fi
   useradd --system --home /var/lib/maddy --shell /usr/sbin/nologin maddy
+}
+
+ensure_farm_user() {
+  getent group farm >/dev/null 2>&1 || groupadd --system farm
+  if ! id -u farmapi >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --shell /usr/sbin/nologin -g farm farmapi
+  fi
 }
 
 write_configs() {
@@ -198,6 +208,27 @@ ReadWritePaths=${FARM_DIR}
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  write_managed_file "$API_UNIT" <<EOF
+[Unit]
+Description=Local mail API for /opt/farm/worker_farm.db
+After=network.target
+
+[Service]
+User=farmapi
+Group=farm
+ExecStart=/usr/bin/python3 ${API} --bind 127.0.0.1 --port ${API_PORT}
+Restart=on-failure
+RestartSec=1s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${FARM_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 write_parser_and_db() {
@@ -276,7 +307,9 @@ def main():
     controller = Controller(Handler(), hostname="127.0.0.1", port=2525)
     controller.start()
     try:
-        asyncio.get_event_loop().run_forever()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
     finally:
         controller.stop()
 
@@ -286,6 +319,105 @@ if __name__ == "__main__":
 EOF
   chmod 0755 "$SINK"
 
+  write_managed_file "$API" <<'EOF'
+import argparse
+import json
+import sqlite3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+DB_PATH = "/opt/farm/worker_farm.db"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj=None):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if obj is not None:
+            self.wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    def do_GET(self):
+        if self.path != "/unread":
+            self._json(404, {"error": "not_found"})
+            return
+
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "select id,email,link,created_at from verification_links where status='pending' order by id asc limit 1"
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        self._json(
+            200,
+            {"id": row[0], "email": row[1], "link": row[2], "created_at": row[3]},
+        )
+
+    def do_POST(self):
+        if self.path != "/read":
+            self._json(404, {"error": "not_found"})
+            return
+
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError:
+            self._json(400, {"error": "bad_request"})
+            return
+
+        try:
+            body = self.rfile.read(length) if length else b"{}"
+            data = json.loads(body.decode("utf-8"))
+            rid = int(data.get("id"))
+        except Exception:
+            self._json(400, {"error": "bad_request"})
+            return
+
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            try:
+                cur = conn.cursor()
+                cur.execute("delete from verification_links where id=? and status='pending'", (rid,))
+                deleted = cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            self._json(500, {"error": "db_error"})
+            return
+
+        if deleted:
+            self._json(200, {"deleted": True})
+        else:
+            self._json(404, {"deleted": False})
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--bind", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8091)
+    args = p.parse_args()
+    httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+  chmod 0755 "$API"
+
   python3 - <<EOF
 import sqlite3
 conn = sqlite3.connect("${DB}", timeout=10)
@@ -294,12 +426,18 @@ cur.execute("CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY K
 conn.commit()
 conn.close()
 EOF
+
+  chown -R root:farm "$FARM_DIR"
+  chmod 0770 "$FARM_DIR"
+  chmod 0750 "$PARSER" "$SINK" "$API"
+  chmod 0660 "$DB" || true
 }
 
 start_services() {
   systemctl daemon-reload
   systemctl enable --now mail-allow-smtp25.service
   systemctl enable --now farm-smtp-sink.service
+  systemctl enable --now farm-mail-api.service
   systemctl reset-failed maddy.service 2>/dev/null || true
   systemctl enable --now maddy.service
 }
@@ -337,6 +475,7 @@ main() {
   install_deps
   install_maddy
   ensure_user
+  ensure_farm_user
   write_parser_and_db
   write_configs
   start_services
