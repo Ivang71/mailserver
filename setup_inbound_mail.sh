@@ -401,6 +401,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 DB_PATH = "/opt/farm/worker_farm.db"
+TTL_SECONDS = 3600
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -412,6 +413,11 @@ class Handler(BaseHTTPRequestHandler):
         if obj is not None:
             self.wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
 
+    def _cleanup(self, cur):
+        cur.execute(
+            "delete from verification_links where status='pending' and created_at < datetime('now','-1 hour')"
+        )
+
     def do_GET(self):
         if self.path != "/unread":
             self._json(404, {"error": "not_found"})
@@ -420,10 +426,12 @@ class Handler(BaseHTTPRequestHandler):
         conn = sqlite3.connect(DB_PATH, timeout=10)
         try:
             cur = conn.cursor()
+            self._cleanup(cur)
             cur.execute(
                 "select id,email,link,created_at from verification_links where status='pending' order by id asc"
             )
             rows = cur.fetchall()
+            conn.commit()
         finally:
             conn.close()
 
@@ -462,6 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             conn = sqlite3.connect(DB_PATH, timeout=10)
             try:
                 cur = conn.cursor()
+                self._cleanup(cur)
                 cur.execute("delete from verification_links where id=? and status='pending'", (rid,))
                 deleted = cur.rowcount
                 conn.commit()
@@ -513,9 +522,12 @@ start_services() {
   systemctl daemon-reload
   systemctl enable --now mail-allow-smtp25.service
   systemctl enable --now farm-smtp-sink.service
+  systemctl restart farm-smtp-sink.service
   systemctl enable --now farm-mail-api.service
+  systemctl restart farm-mail-api.service
   systemctl reset-failed maddy.service 2>/dev/null || true
   systemctl enable --now maddy.service
+  systemctl restart maddy.service
 }
 
 do_test() {
