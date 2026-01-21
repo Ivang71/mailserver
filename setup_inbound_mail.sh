@@ -3,18 +3,19 @@ set -euo pipefail
 
 MADDY_VERSION="${MADDY_VERSION:-0.7.1}"
 PRIMARY_DOMAIN="${PRIMARY_DOMAIN:-ragoona.com}"
-MX_HOSTNAME="${MX_HOSTNAME:-mx1.ragoona.com}"
+MX_HOSTNAME="${MX_HOSTNAME:-$PRIMARY_DOMAIN}"
+FARM_DIR="${FARM_DIR:-/opt/farm}"
+API_PORT="${API_PORT:-8091}"
 
 MADDY_BIN="/usr/local/bin/maddy"
 MADDY_CONF_DIR="/etc/maddy"
 MADDY_CONF="${MADDY_CONF_DIR}/maddy.conf"
 
-FARM_DIR="/opt/farm"
 PARSER="${FARM_DIR}/parse_email.py"
 SINK="${FARM_DIR}/smtp_sink.py"
 API="${FARM_DIR}/mail_api.py"
 DB="${FARM_DIR}/worker_farm.db"
-API_PORT="${API_PORT:-8091}"
+PY_VENV_DIR="${PY_VENV_DIR:-${FARM_DIR}/venv}"
 
 FW_HELPER="/usr/local/sbin/mail-allow-smtp25"
 FW_UNIT="/etc/systemd/system/mail-allow-smtp25.service"
@@ -28,6 +29,47 @@ need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "run as root"
   fi
+}
+
+need_systemd() {
+  command -v systemctl >/dev/null 2>&1 || die "systemd required (systemctl not found)"
+}
+
+fetch_url() {
+  local url="$1"
+  local out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$out"
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$out" "$url"
+    return 0
+  fi
+  die "need curl or wget"
+}
+
+pkg_mgr() {
+  if command -v apt-get >/dev/null 2>&1; then echo apt; return 0; fi
+  if command -v dnf >/dev/null 2>&1; then echo dnf; return 0; fi
+  if command -v yum >/dev/null 2>&1; then echo yum; return 0; fi
+  if command -v pacman >/dev/null 2>&1; then echo pacman; return 0; fi
+  echo ""
+}
+
+pkg_install() {
+  local mgr
+  mgr="$(pkg_mgr)"
+  [[ -n "$mgr" ]] || die "no supported package manager found (apt/dnf/yum/pacman)"
+  case "$mgr" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+    pacman) pacman -Sy --noconfirm --needed "$@" ;;
+  esac
 }
 
 write_managed_file() {
@@ -51,23 +93,43 @@ install_maddy() {
   if [[ -x "$MADDY_BIN" ]]; then
     return 0
   fi
-  if ! command -v zstd >/dev/null 2>&1; then
-    apt-get update -y
-    apt-get install -y zstd
+  command -v tar >/dev/null 2>&1 || pkg_install tar
+  command -v zstd >/dev/null 2>&1 || pkg_install zstd
+
+  local arch
+  arch="$(uname -m)"
+  local rel_arch
+  case "$arch" in
+    x86_64|amd64) rel_arch="x86_64" ;;
+    aarch64|arm64) rel_arch="arm64" ;;
+    *) rel_arch="" ;;
+  esac
+
+  if [[ -z "$rel_arch" ]]; then
+    die "unsupported arch for release install: ${arch} (set MADDY_BIN to an existing maddy or install manually)"
   fi
   local tarzst="/tmp/maddy-${MADDY_VERSION}.tar.zst"
-  wget -O "$tarzst" "https://github.com/foxcpp/maddy/releases/download/v${MADDY_VERSION}/maddy-${MADDY_VERSION}-x86_64-linux-musl.tar.zst"
-  rm -rf "/tmp/maddy-${MADDY_VERSION}-x86_64-linux-musl"
+  fetch_url "$(
+    printf '%s' "https://github.com/foxcpp/maddy/releases/download/v${MADDY_VERSION}/maddy-${MADDY_VERSION}-${rel_arch}-linux-musl.tar.zst"
+  )" "$tarzst"
+  rm -rf "/tmp/maddy-${MADDY_VERSION}-${rel_arch}-linux-musl"
   tar --zstd -xf "$tarzst" -C /tmp
-  install -m 0755 "/tmp/maddy-${MADDY_VERSION}-x86_64-linux-musl/maddy" "$MADDY_BIN"
+  install -m 0755 "/tmp/maddy-${MADDY_VERSION}-${rel_arch}-linux-musl/maddy" "$MADDY_BIN"
 }
 
 install_deps() {
-  if python3 -c "import aiosmtpd" >/dev/null 2>&1; then
-    return 0
+  command -v python3 >/dev/null 2>&1 || die "python3 required"
+  if [[ ! -x "${PY_VENV_DIR}/bin/python" ]]; then
+    case "$(pkg_mgr)" in
+      apt) pkg_install python3-venv python3-pip ;;
+      dnf|yum) pkg_install python3-pip ;;
+      pacman) pkg_install python-pip ;;
+      *) die "cannot prepare python venv (no pkg manager)" ;;
+    esac
+    python3 -m venv "$PY_VENV_DIR"
   fi
-  apt-get update -y
-  apt-get install -y python3-aiosmtpd
+
+  "${PY_VENV_DIR}/bin/pip" install --no-input --disable-pip-version-check --no-cache-dir aiosmtpd >/dev/null || true
 }
 
 ensure_user() {
@@ -88,6 +150,7 @@ write_configs() {
   install -d -m 0755 "$MADDY_CONF_DIR"
   install -d -m 0755 "/etc/maddy/certs/${MX_HOSTNAME}"
 
+  command -v openssl >/dev/null 2>&1 || pkg_install openssl
   if [[ ! -e "/etc/maddy/certs/${MX_HOSTNAME}/fullchain.pem" || ! -e "/etc/maddy/certs/${MX_HOSTNAME}/privkey.pem" ]]; then
     openssl req -x509 -newkey rsa:2048 -nodes \
       -keyout "/etc/maddy/certs/${MX_HOSTNAME}/privkey.pem" \
@@ -135,15 +198,26 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v nft >/dev/null 2>&1; then
-  exit 0
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status 2>/dev/null | grep -qE '^Status:\s+active'; then
+    ufw allow 25/tcp >/dev/null 2>&1 || true
+  fi
 fi
 
-if nft list chain inet eus_firewall input 2>/dev/null | grep -qE 'tcp dport 25 accept'; then
-  exit 0
+if command -v firewall-cmd >/dev/null 2>&1; then
+  if firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-service=smtp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
 fi
 
-nft add rule inet eus_firewall input tcp dport 25 accept
+if command -v nft >/dev/null 2>&1; then
+  if nft list chain inet eus_firewall input >/dev/null 2>&1; then
+    if ! nft list chain inet eus_firewall input 2>/dev/null | grep -qE 'tcp dport 25 accept'; then
+      nft add rule inet eus_firewall input tcp dport 25 accept >/dev/null 2>&1 || true
+    fi
+  fi
+fi
 EOF
   chmod 0755 "$FW_HELPER"
 
@@ -196,7 +270,7 @@ After=network.target
 [Service]
 User=root
 Group=root
-ExecStart=/usr/bin/python3 ${SINK}
+ExecStart=${PY_VENV_DIR}/bin/python ${SINK}
 Restart=on-failure
 RestartSec=1s
 NoNewPrivileges=true
@@ -217,7 +291,7 @@ After=network.target
 [Service]
 User=farmapi
 Group=farm
-ExecStart=/usr/bin/python3 ${API} --bind 127.0.0.1 --port ${API_PORT}
+ExecStart=${PY_VENV_DIR}/bin/python ${API} --bind 127.0.0.1 --port ${API_PORT}
 Restart=on-failure
 RestartSec=1s
 NoNewPrivileges=true
@@ -420,7 +494,7 @@ if __name__ == "__main__":
 EOF
   chmod 0755 "$API"
 
-  python3 - <<EOF
+  "${PY_VENV_DIR}/bin/python" - <<EOF
 import sqlite3
 conn = sqlite3.connect("${DB}", timeout=10)
 cur = conn.cursor()
@@ -445,8 +519,9 @@ start_services() {
 }
 
 do_test() {
-  python3 - <<'EOF'
+  "${PY_VENV_DIR}/bin/python" - <<'EOF'
 import smtplib
+import time
 from email.message import EmailMessage
 
 msg = EmailMessage()
@@ -456,12 +531,21 @@ msg["Subject"] = "cf verify"
 msg.set_content("hi")
 msg.add_alternative('<a href="https://dash.cloudflare.com/verify-email?token=ABCdef_123-xyz">verify</a>', subtype="html")
 
-s = smtplib.SMTP("127.0.0.1", 25, timeout=10)
+last = None
+for _ in range(60):
+    try:
+        s = smtplib.SMTP("127.0.0.1", 25, timeout=10)
+        break
+    except OSError as e:
+        last = e
+        time.sleep(0.2)
+else:
+    raise SystemExit(str(last))
 s.send_message(msg)
 s.quit()
 EOF
 
-  python3 - <<'EOF'
+  "${PY_VENV_DIR}/bin/python" - <<'EOF'
 import sqlite3
 conn = sqlite3.connect("/opt/farm/worker_farm.db", timeout=10)
 cur = conn.cursor()
@@ -470,10 +554,21 @@ row = cur.fetchone()
 print(row)
 conn.close()
 EOF
+
+  "${PY_VENV_DIR}/bin/python" - <<'EOF'
+import json
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8091/unread", timeout=5) as r:
+  body = r.read().decode("utf-8")
+obj = json.loads(body)
+print(len(obj))
+EOF
 }
 
 main() {
   need_root
+  need_systemd
   install_deps
   install_maddy
   ensure_user

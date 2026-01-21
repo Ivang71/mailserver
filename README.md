@@ -36,7 +36,7 @@
 ### 1) Mail server + parser + API
 
 ```bash
-sudo /root/mail/setup_inbound_mail.sh --test
+sudo ./setup_inbound_mail.sh --test
 ```
 
 ### 2) Expose the API via Cloudflare Tunnel (no 80/443 needed)
@@ -48,7 +48,7 @@ This creates:
 
 ```bash
 export CF_API_TOKEN="(your token)"
-sudo /root/mail/setup_cloudflare_tunnel_mail_api.sh
+sudo ./setup_cloudflare_tunnel_mail_api.sh
 ```
 
 The tunnel runs using a tunnel **run token** stored in `/etc/cloudflared/api.token` (not your API token).
