@@ -6,8 +6,33 @@
 - **Parser**: mail is forwarded to a local SMTP sink which feeds raw messages into `/opt/farm/parse_email.py`.
 - **DB**: SQLite at `/opt/farm/worker_farm.db` (table `verification_links`).
 - **API (localhost-only)**: `farm-mail-api` listens on `127.0.0.1:8091`.
-  - `GET /unread` → returns the next pending row or `204` if none.
+  - `GET /unread` → returns JSON array of all pending rows (`[]` if none).
   - `POST /read` with JSON `{"id": <int>}` → deletes that row (only if `status='pending'`).
+
+## Consumer overview (mail + api)
+
+### What you do
+1. Send/trigger an email to any address at `@ragoona.com`.
+2. Poll the API for unread items.
+3. Pick the item you want, use its `link`, then delete it via `/read`.
+
+### API base
+- Public: `https://mailapi.ragoona.com`
+- Local (on the server): `http://127.0.0.1:8091`
+
+### Endpoints
+- `GET /unread`
+  - Returns `[]` if none
+  - Returns `[{"id":<int>,"email":"<addr@ragoona.com>","link":"<url>","created_at":"<ts>"}, ...]`
+- `POST /read`
+  - Body: `{"id":<int>}`
+  - `200` → `{"deleted":true}`
+  - `404` → `{"deleted":false}`
+
+### Mail behavior
+- Any recipient at `@ragoona.com` is accepted.
+- Emails containing a Cloudflare verification URL appear via `GET /unread`.
+- Cloudflare might get flaky, retry with short backoff.
 
 ## Install / reproduce on a new machine
 

@@ -347,20 +347,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cur = conn.cursor()
             cur.execute(
-                "select id,email,link,created_at from verification_links where status='pending' order by id asc limit 1"
+                "select id,email,link,created_at from verification_links where status='pending' order by id asc"
             )
-            row = cur.fetchone()
+            rows = cur.fetchall()
         finally:
             conn.close()
 
-        if not row:
-            self.send_response(204)
-            self.end_headers()
+        if not rows:
+            self._json(200, [])
             return
 
         self._json(
             200,
-            {"id": row[0], "email": row[1], "link": row[2], "created_at": row[3]},
+            [
+                {"id": r[0], "email": r[1], "link": r[2], "created_at": r[3]}
+                for r in rows
+            ],
         )
 
     def do_POST(self):
