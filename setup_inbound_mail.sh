@@ -6,6 +6,8 @@ PRIMARY_DOMAIN="${PRIMARY_DOMAIN:-ragoona.com}"
 MX_HOSTNAME="${MX_HOSTNAME:-$PRIMARY_DOMAIN}"
 FARM_DIR="${FARM_DIR:-/opt/farm}"
 API_PORT="${API_PORT:-8091}"
+UPSTREAM_DNS="${UPSTREAM_DNS:-1.1.1.1 1.0.0.1 8.8.8.8}"
+RESOLV_STATIC="/etc/resolv.conf.static"
 
 MADDY_BIN="/usr/local/bin/maddy"
 MADDY_CONF_DIR="/etc/maddy"
@@ -87,6 +89,17 @@ write_managed_file() {
   fi
   install -D -m 0644 "$tmp" "$path"
   rm -f "$tmp"
+}
+
+ensure_system_dns() {
+  local ns
+  local out=""
+  for ns in $UPSTREAM_DNS; do
+    out+="nameserver ${ns}"$'\n'
+  done
+  out+="options timeout:2 attempts:2"$'\n'
+  write_managed_file "$RESOLV_STATIC" <<<"$out"
+  ln -sfn "$RESOLV_STATIC" /etc/resolv.conf
 }
 
 install_maddy() {
@@ -660,6 +673,7 @@ EOF
 main() {
   need_root
   need_systemd
+  ensure_system_dns
   install_deps
   install_maddy
   ensure_user

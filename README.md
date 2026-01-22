@@ -33,13 +33,34 @@
 
 ## Install / reproduce on a new machine
 
+### 0) Server DNS (resolver)
+
+`setup_inbound_mail.sh` now pins a static resolver config at `/etc/resolv.conf.static` and symlinks `/etc/resolv.conf` to it, so DNS keeps working even if `systemd-resolved` dies.
+
+Override via:
+
+```bash
+export UPSTREAM_DNS="1.1.1.1 1.0.0.1 8.8.8.8"
+```
+
 ### 1) Mail server + parser + API
 
 ```bash
 sudo ./setup_inbound_mail.sh --test
 ```
 
-### 2) Expose the API via Cloudflare Tunnel (no 80/443 needed)
+### 2) Cloudflare DNS for inbound mail (MX + A)
+
+This creates/updates:
+- `A ${MX_HOSTNAME} -> (this server public IP)` (unproxied)
+- `MX ${DOMAIN} -> ${MX_HOSTNAME}` (priority 10 by default)
+
+```bash
+export CF_API_TOKEN="(your token)"
+sudo ./setup_cloudflare_dns_inbound_mail.sh
+```
+
+### 3) Expose the API via Cloudflare Tunnel (no 80/443 needed)
 
 This creates:
 - a tunnel
