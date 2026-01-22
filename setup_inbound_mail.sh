@@ -270,6 +270,7 @@ After=network.target
 [Service]
 User=root
 Group=root
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=${PY_VENV_DIR}/bin/python ${SINK}
 Restart=on-failure
 RestartSec=1s
@@ -287,12 +288,16 @@ EOF
 [Unit]
 Description=Local mail API for /opt/farm/worker_farm.db
 After=network.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 User=farmapi
 Group=farm
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=${PY_VENV_DIR}/bin/python -B -m py_compile ${API}
 ExecStart=${PY_VENV_DIR}/bin/python ${API} --bind 127.0.0.1 --port ${API_PORT}
-Restart=on-failure
+Restart=always
 RestartSec=1s
 NoNewPrivileges=true
 PrivateTmp=true
@@ -309,42 +314,108 @@ write_parser_and_db() {
   install -d -m 0755 "$FARM_DIR"
 
   write_managed_file "$PARSER" <<'EOF'
-import re
 import sqlite3
 import sys
 from email import message_from_bytes
 from email.utils import getaddresses
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlparse
 
 raw = sys.stdin.buffer.read()
 msg = message_from_bytes(raw)
 
-body = ""
-if msg.is_multipart():
-    for part in msg.walk():
-        if part.get_content_type() == "text/html":
-            payload = part.get_payload(decode=True) or b""
-            charset = part.get_content_charset() or "utf-8"
-            body = payload.decode(charset, errors="replace")
-            break
-else:
-    payload = msg.get_payload(decode=True) or b""
-    charset = msg.get_content_charset() or "utf-8"
-    body = payload.decode(charset, errors="replace")
-
-m = re.search(r"https://dash\.cloudflare\.com/verify-email\?token=[a-zA-Z0-9._-]+", body)
-if not m:
-    sys.exit(0)
+mail_from = (msg.get("from") or "").strip()
+rcpt_to = (msg.get("to") or "").strip()
+subject = (msg.get("subject") or "").strip()
 
 to_hdr = msg.get_all("to", [])
 addr = getaddresses(to_hdr)
 recipient = addr[0][1] if addr else ""
-link = m.group(0)
+
+
+class HrefParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        for k, v in attrs:
+            if k.lower() == "href" and v:
+                self.hrefs.append(v)
+
+
+def decode(part):
+    payload = part.get_payload(decode=True) or b""
+    cs = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(cs, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def iter_text_parts(m):
+    if m.is_multipart():
+        for p in m.walk():
+            ct = p.get_content_type()
+            if ct in ("text/plain", "text/html"):
+                yield ct, decode(p)
+        return
+    ct = m.get_content_type()
+    if ct in ("text/plain", "text/html"):
+        yield ct, decode(m)
+
+
+def extract_urls(parts):
+    urls = set()
+    for ct, text in parts:
+        if not text:
+            continue
+        if ct == "text/html":
+            p = HrefParser()
+            p.feed(text)
+            for u in p.hrefs:
+                urls.add(u)
+        for u in text.replace("\r", " ").replace("\n", " ").split():
+            if u.startswith("http://") or u.startswith("https://"):
+                urls.add(u.strip(" \t\r\n\"'<>(),.;"))
+    return urls
+
+
+def is_verify(u):
+    if "verif" not in u.lower():
+        return False
+    p = urlparse(u)
+    if p.netloc.lower() != "dash.cloudflare.com":
+        return False
+    token = (parse_qs(p.query).get("token") or [""])[0]
+    return bool(token)
+
 
 conn = sqlite3.connect("/opt/farm/worker_farm.db", timeout=10)
 cur = conn.cursor()
 cur.execute(
+    "CREATE TABLE IF NOT EXISTS raw_emails (id INTEGER PRIMARY KEY AUTOINCREMENT, mail_from TEXT, rcpt_to TEXT, subject TEXT, raw BLOB, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+)
+cur.execute("delete from raw_emails where created_at < datetime('now','-1 hour')")
+cur.execute(
+    "INSERT INTO raw_emails (mail_from, rcpt_to, subject, raw) VALUES (?, ?, ?, ?)",
+    (mail_from, rcpt_to, subject, sqlite3.Binary(raw)),
+)
+
+parts = list(iter_text_parts(msg))
+urls = [u for u in extract_urls(parts) if is_verify(u)]
+if not urls:
+    conn.commit()
+    conn.close()
+    sys.exit(0)
+link = sorted(urls)[0]
+
+cur.execute(
     "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
 )
+cur.execute("delete from verification_links where status='pending' and created_at < datetime('now','-1 hour')")
 cur.execute(
     "INSERT INTO verification_links (email, link, status) VALUES (?, ?, 'pending')",
     (recipient, link),
@@ -406,12 +477,15 @@ TTL_SECONDS = 3600
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj=None):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if obj is not None:
-            self.wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if obj is not None:
+                self.wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _cleanup(self, cur):
         cur.execute(
@@ -419,71 +493,76 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
-        if self.path != "/unread":
-            self._json(404, {"error": "not_found"})
-            return
-
-        conn = sqlite3.connect(DB_PATH, timeout=10)
         try:
-            cur = conn.cursor()
-            self._cleanup(cur)
-            cur.execute(
-                "select id,email,link,created_at from verification_links where status='pending' order by id asc"
-            )
-            rows = cur.fetchall()
-            conn.commit()
-        finally:
-            conn.close()
+            if self.path != "/unread":
+                self._json(404, {"error": "not_found"})
+                return
 
-        if not rows:
-            self._json(200, [])
-            return
-
-        self._json(
-            200,
-            [
-                {"id": r[0], "email": r[1], "link": r[2], "created_at": r[3]}
-                for r in rows
-            ],
-        )
-
-    def do_POST(self):
-        if self.path != "/read":
-            self._json(404, {"error": "not_found"})
-            return
-
-        try:
-            length = int(self.headers.get("content-length", "0"))
-        except ValueError:
-            self._json(400, {"error": "bad_request"})
-            return
-
-        try:
-            body = self.rfile.read(length) if length else b"{}"
-            data = json.loads(body.decode("utf-8"))
-            rid = int(data.get("id"))
-        except Exception:
-            self._json(400, {"error": "bad_request"})
-            return
-
-        try:
             conn = sqlite3.connect(DB_PATH, timeout=10)
             try:
                 cur = conn.cursor()
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+                )
+                self._cleanup(cur)
+                cur.execute(
+                    "select id,email,link,created_at from verification_links where status='pending' order by id asc"
+                )
+                rows = cur.fetchall()
+                conn.commit()
+            finally:
+                conn.close()
+
+            self._json(
+                200,
+                [{"id": r[0], "email": r[1], "link": r[2], "created_at": r[3]} for r in rows],
+            )
+        except sqlite3.OperationalError:
+            self._json(500, {"error": "db_error"})
+        except Exception:
+            self._json(500, {"error": "internal_error"})
+
+    def do_POST(self):
+        try:
+            if self.path != "/read":
+                self._json(404, {"error": "not_found"})
+                return
+
+            try:
+                length = int(self.headers.get("content-length", "0"))
+            except ValueError:
+                self._json(400, {"error": "bad_request"})
+                return
+
+            try:
+                body = self.rfile.read(length) if length else b"{}"
+                data = json.loads(body.decode("utf-8"))
+                rid = int(data.get("id"))
+            except Exception:
+                self._json(400, {"error": "bad_request"})
+                return
+
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+                )
                 self._cleanup(cur)
                 cur.execute("delete from verification_links where id=? and status='pending'", (rid,))
                 deleted = cur.rowcount
                 conn.commit()
             finally:
                 conn.close()
+
+            if deleted:
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"deleted": False})
         except sqlite3.OperationalError:
             self._json(500, {"error": "db_error"})
-            return
-
-        if deleted:
-            self._json(200, {"deleted": True})
-        else:
-            self._json(404, {"deleted": False})
+        except Exception:
+            self._json(500, {"error": "internal_error"})
 
     def log_message(self, fmt, *args):
         return
