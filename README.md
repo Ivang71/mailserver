@@ -12,7 +12,7 @@
 ### What you do
 1. Send/trigger an email to any address at `@ragoona.com`.
 2. Poll the API for unread items.
-3. Pick the item you want, use its `link`, then delete it via `/read`.
+3. Pick the item you want, use its `link` (URL or code), then delete it via `/read`.
 
 ### API base
 - Public: `https://api.ragoona.com`
@@ -20,7 +20,12 @@
 ### Endpoints
 - `GET /unread`
   - Returns `[]` if none
-  - Returns `[{"id":<int>,"email":"<addr@ragoona.com>","link":"<url>","created_at":"<ts>"}, ...]`
+  - Returns `[{"id":<int>,"email":"<addr@ragoona.com>","link":"<url>","code":"<numeric_code>","created_at":"<ts>"}, ...]`
+  - `link` will be a URL string (or empty string/null if only code found)
+  - `code` will be a numeric string (or empty string/null if only link found)
+- `GET /email?id=<int>`
+  - Returns the full raw RFC822 email content (headers + body)
+  - Useful for debugging if extraction fails
 - `POST /read`
   - Body: `{"id":<int>}`
   - `200` → `{"deleted":true}`
@@ -28,7 +33,9 @@
 
 ### Mail behavior
 - Any recipient at `@ragoona.com` is accepted.
-- Emails containing a Cloudflare verification URL appear via `GET /unread`.
+- Emails are parsed immediately for Cloudflare verification links or codes.
+- Full raw emails are stored for 1 hour in `raw_emails` (debug/fallback).
+- Extracted links/codes are stored in `verification_links` (returned by `/unread`).
 - Cloudflare might get flaky, retry with short backoff.
 
 ## Install / reproduce on a new machine

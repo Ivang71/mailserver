@@ -327,6 +327,7 @@ write_parser_and_db() {
   install -d -m 0755 "$FARM_DIR"
 
   write_managed_file "$PARSER" <<'EOF'
+import re
 import sqlite3
 import sys
 from email import message_from_bytes
@@ -406,6 +407,22 @@ def is_verify(u):
     return bool(token)
 
 
+def extract_cf_code(parts):
+    # Cloudflare login code format: 6-8 digits, typically alone on a line or near "Enter this token"
+    # Example: "7747348"
+    for ct, text in parts:
+        if not text:
+            continue
+        # Look for the code pattern in plain text or HTML
+        # Simple heuristic: 6-8 digits, possibly surrounded by whitespace
+        matches = re.findall(r"\b(\d{6,8})\b", text)
+        for code in matches:
+            # Context check could be added here if needed, but the code itself is usually unique enough
+            # We can also check if the email subject/body mentions "Cloudflare" and "login token"
+            return code
+    return ""
+
+
 conn = sqlite3.connect("/opt/farm/worker_farm.db", timeout=10)
 cur = conn.cursor()
 cur.execute(
@@ -419,19 +436,22 @@ cur.execute(
 
 parts = list(iter_text_parts(msg))
 urls = [u for u in extract_urls(parts) if is_verify(u)]
-if not urls:
+code = extract_cf_code(parts) if not urls else ""
+
+if not urls and not code:
     conn.commit()
     conn.close()
     sys.exit(0)
-link = sorted(urls)[0]
+
+link = sorted(urls)[0] if urls else ""
 
 cur.execute(
-    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, code TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
 )
 cur.execute("delete from verification_links where status='pending' and created_at < datetime('now','-1 hour')")
 cur.execute(
-    "INSERT INTO verification_links (email, link, status) VALUES (?, ?, 'pending')",
-    (recipient, link),
+    "INSERT INTO verification_links (email, link, code, status) VALUES (?, ?, ?, 'pending')",
+    (recipient, link, code),
 )
 conn.commit()
 conn.close()
@@ -515,11 +535,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, code TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
                 )
                 self._cleanup(cur)
                 cur.execute(
-                    "select id,email,link,created_at from verification_links where status='pending' order by id asc"
+                    "select id,email,link,code,created_at from verification_links where status='pending' order by id asc"
                 )
                 rows = cur.fetchall()
                 conn.commit()
@@ -528,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self._json(
                 200,
-                [{"id": r[0], "email": r[1], "link": r[2], "created_at": r[3]} for r in rows],
+                [{"id": r[0], "email": r[1], "link": r[2], "code": r[3], "created_at": r[4]} for r in rows],
             )
         except sqlite3.OperationalError:
             self._json(500, {"error": "db_error"})
@@ -559,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+                    "CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, code TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
                 )
                 self._cleanup(cur)
                 cur.execute("delete from verification_links where id=? and status='pending'", (rid,))
@@ -599,7 +619,7 @@ EOF
 import sqlite3
 conn = sqlite3.connect("${DB}", timeout=10)
 cur = conn.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+cur.execute("CREATE TABLE IF NOT EXISTS verification_links (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, link TEXT, code TEXT, status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
 conn.commit()
 conn.close()
 EOF
